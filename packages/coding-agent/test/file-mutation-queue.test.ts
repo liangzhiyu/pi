@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -96,9 +96,100 @@ describe("withFileMutationQueue", () => {
 
 		expect(order).toEqual(["target:start", "target:end", "alias:start", "alias:end"]);
 	});
+
+	// Regression: https://github.com/earendil-works/pi/issues/11244
+	it.each([false, true])(
+		"serializes hard-link aliases in registration order (initially missing: %s)",
+		async (missing) => {
+			const dir = await createTempDir();
+			const targetPath = join(dir, "target.txt");
+			const aliasPath = join(dir, "alias.txt");
+			if (!missing) {
+				await writeFile(targetPath, "hello\n");
+				await link(targetPath, aliasPath);
+			}
+			const started = createDeferred();
+			const release = createDeferred();
+			const order: string[] = [];
+			const first = withFileMutationQueue(targetPath, async () => {
+				if (missing) {
+					await writeFile(targetPath, "hello\n");
+					await link(targetPath, aliasPath);
+				}
+				order.push("first:start");
+				started.resolve();
+				await release.promise;
+				order.push("first:end");
+			});
+			await started.promise;
+			const second = withFileMutationQueue(aliasPath, async () => {
+				order.push("second");
+			});
+			const third = withFileMutationQueue(targetPath, async () => {
+				order.push("third");
+			});
+			try {
+				// Registration is FIFO, so this independent operation witnesses both reservations.
+				await withFileMutationQueue(join(dir, "independent.txt"), async () => {});
+				expect(order).toEqual(["first:start"]);
+			} finally {
+				release.resolve();
+				await Promise.all([first, second, third]);
+			}
+			expect(order).toEqual(["first:start", "first:end", "second", "third"]);
+		},
+	);
 });
 
 describe("built-in edit and write tools", () => {
+	// Regression: https://github.com/earendil-works/pi/issues/11244
+	it("preserves both parallel edits through hard links", async () => {
+		const dir = await createTempDir();
+		const targetPath = join(dir, "target.txt");
+		const aliasPath = join(dir, "alias.txt");
+		await writeFile(targetPath, "alpha\nbeta\n");
+		await link(targetPath, aliasPath);
+		const firstRead = createDeferred();
+		const release = createDeferred();
+		let secondStarted = false;
+		const editTool = createEditTool(dir, {
+			operations: {
+				access: async (path) => {
+					if (path === aliasPath) secondStarted = true;
+					await access(path);
+				},
+				readFile: async (path) => {
+					const buffer = await readFile(path);
+					if (path === targetPath) {
+						firstRead.resolve();
+						await release.promise;
+					}
+					return buffer;
+				},
+				writeFile: async (path, content) => writeFile(path, content, "utf8"),
+			},
+		});
+		const first = editTool.execute("call-1", {
+			path: targetPath,
+			edits: [{ oldText: "alpha", newText: "ALPHA" }],
+		});
+		await firstRead.promise;
+		const second = editTool.execute("call-2", {
+			path: aliasPath,
+			edits: [{ oldText: "beta", newText: "BETA" }],
+		});
+		try {
+			await withFileMutationQueue(join(dir, "independent.txt"), async () => {});
+			// On the broken queue, finish the second edit before releasing the first stale read.
+			if (secondStarted) await second;
+		} finally {
+			release.resolve();
+			await Promise.all([first, second]);
+		}
+		expect(await readFile(targetPath, "utf8")).toBe("ALPHA\nBETA\n");
+		expect(await readFile(aliasPath, "utf8")).toBe("ALPHA\nBETA\n");
+	});
+
 	it("preserves both parallel edits on the same file", async () => {
 		const dir = await createTempDir();
 		const filePath = join(dir, "parallel-edit.txt");
